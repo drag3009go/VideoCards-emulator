@@ -4,22 +4,33 @@ A high-performance hardware emulator focused on recreating legacy graphics proce
 
 ---
 
-## 📊 Current Status
+## 📊 Supported Video Cards
 
-| Metric | Details |
-| :--- | :--- |
-| **Name** | ATI Rage 128 |
-| **Number** | 1 |
-| **Working** | 🚀 90% |
-| **State** | 🛠️ Devolopend |
+| Name | Number | Working | State |
+| :--- | :--- | :--- | :--- |
+| **ATI Rage 128** | 1 | 🚀 90% | 🛠️ Devolopend |
+
+---
+
+## ✨ Features
+
+* **OpenCL Tester** — Real-time performance and behavior verification by comparing the emulated GPU output against a real physical graphics card using OpenCL.
+* **Modular Codebase** — Clean architecture with a dedicated vendor core and separate cards implementation.
+
+---
+
+## 🗺️ Roadmap
+
+* [ ] **QEMU Support** — Integration with QEMU for complete system emulation.
+* [ ] **Add Other AMD Video Cards** — Expanding the catalog with more classic architectures from AMD/ATI.
 
 ---
 
 ## 🛠️ Project Structure
 
 * **`common/`** — Shared core utilities, math libraries, and cross-platform definitions.
-* **`emulator/`** — The core emulation logic, registers mapping, and memory management.
-* **`tester/`** — Automated test suites, framework validation, and render verification tools.
+* **`emulator/`** — Core logic containing `core.cpp`, `main.cpp`, and the `cards/ati/128` implementation.
+* **`tester/`** — Automated test suites, OpenCL validation tools, and verification framework.
 
 ---
 
@@ -44,4 +55,5 @@ Make sure you have **CMake** and a modern **C++ compiler** installed on your sys
 
 ---
 
-
+## 📝 License
+This project is licensed under the MIT License - see the LICENSE file for details.
