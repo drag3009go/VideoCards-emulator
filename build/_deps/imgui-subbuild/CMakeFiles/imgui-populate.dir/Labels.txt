@@ -1,0 +1,14 @@
+# Target labels
+ imgui-populate
+# Source files and their labels
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/CMakeFiles/imgui-populate-complete.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-build.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-configure.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-download.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-install.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-mkdir.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-patch.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-test.rule
+F:/dev/VidioCards-EMULATOR/build/_deps/imgui-subbuild/imgui-populate-prefix/src/imgui-populate-stamp/imgui-populate-update.rule
