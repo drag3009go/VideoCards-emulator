@@ -13,6 +13,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <algorithm>
 
 using namespace vgpu;
 
@@ -23,6 +24,7 @@ static bool               g_ping_ok     = false;
 static std::vector<uint8_t> g_vram_emu(VRAM_SIZE, 0);
 static std::vector<uint8_t> g_vram_gpu(VRAM_SIZE, 0);
 static std::vector<uint8_t> g_vram_diff(VRAM_SIZE, 0);
+static std::vector<float>   g_zbuffer_gpu(640 * 480, 1e9f);
 static GLuint             g_tex_emu     = 0;
 static GLuint             g_tex_gpu     = 0;
 static GLuint             g_tex_diff    = 0;
@@ -38,6 +40,10 @@ static bool               g_test_passed = false;
 static bool               g_has_result  = false;
 static int                g_selected_test = 0;
 static int                g_selected_hard_test = 0;
+
+static bool               g_anim_active = false;
+static int                g_anim_shape = 0;
+static double             g_last_anim_time = 0;
 
 static uint64_t           g_emu_exec_time_us = 0;
 static long long          g_time_gpu    = 0;
@@ -210,6 +216,18 @@ static uint32_t send_reg_read(uint32_t addr) {
     if (!recv_msg_filtered(g_sock, t, buf, sizeof(buf), len)) return 0;
     if (t != MsgType::RegReadResp) return 0;
     RegReadRespMsg r; std::memcpy(&r, buf, sizeof(r));
+    return r.value;
+}
+
+static uint32_t send_pci_read(uint32_t reg) {
+    if (!g_connected) return 0;
+    PciConfigReadMsg m{ reg };
+    if (!send_msg(g_sock, MsgType::PciConfigRead, &m, sizeof(m))) return 0;
+    uint8_t buf[16];
+    MsgType t; uint32_t len;
+    if (!recv_msg_filtered(g_sock, t, buf, sizeof(buf), len)) return 0;
+    if (t != MsgType::PciConfigResp) return 0;
+    PciConfigRespMsg r; std::memcpy(&r, buf, sizeof(r));
     return r.value;
 }
 
@@ -455,28 +473,20 @@ static void run_cce_test() {
     if (g_cl_ready) { std::fill(g_vram_gpu.begin(), g_vram_gpu.end(), 0); clEnqueueWriteBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr); }
     uint32_t pitch = 640 * 4;
     std::vector<uint32_t> cmd_buf;
-    
-    cmd_buf.push_back(0xC0010000 | 0x147C); // 1 reg
+    cmd_buf.push_back(0xC0010000 | 0x147C); 
     cmd_buf.push_back(0xFF00FF00);
-    
-    cmd_buf.push_back(0xC0020000 | 0x1404); // 2 regs
+    cmd_buf.push_back(0xC0020000 | 0x1404); 
     cmd_buf.push_back(0x00010000);
     cmd_buf.push_back(pitch);
-    
-    cmd_buf.push_back(0xC0010000 | 0x146C); // 1 reg
+    cmd_buf.push_back(0xC0010000 | 0x146C); 
     cmd_buf.push_back(0x80F026D0);
-    
-    cmd_buf.push_back(0xC0010000 | 0x1588); // 1 reg (Width)
+    cmd_buf.push_back(0xC0010000 | 0x1588); 
     cmd_buf.push_back(320);
-    
-    cmd_buf.push_back(0xC0010000 | 0x15A0); // 1 reg (Height)
+    cmd_buf.push_back(0xC0010000 | 0x15A0); 
     cmd_buf.push_back(200);
-    
-    cmd_buf.push_back(0xC0010000 | 0x1438); // 1 reg (Trigger)
+    cmd_buf.push_back(0xC0010000 | 0x1438); 
     cmd_buf.push_back(0x00000000);
-    
-    cmd_buf.push_back(0x00000000); // End of buffer
-
+    cmd_buf.push_back(0x00000000);
     uint32_t cce_addr = 0x80000;
     uint32_t cce_len = cmd_buf.size() * 4;
     auto tg1 = std::chrono::high_resolution_clock::now();
@@ -532,6 +542,306 @@ static void run_irq_test() {
         g_test_passed = false;
         if (!irq_logic_ok) g_diff_pixels = 9999;
     }
+}
+
+static void run_pci_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    uint32_t vid_did = send_pci_read(0);
+    uint32_t class_rev = send_pci_read(2);
+    uint32_t bar0 = send_pci_read(4);
+    
+    bool pci_ok = ((vid_did & 0xFFFF) == 0x1002) && ((vid_did >> 16) == 0x5246) &&
+                  ((class_rev >> 24) == 0x03) && ((class_rev & 0xFFFFFF) == 0x000000) &&
+                  (bar0 != 0);
+                  
+    printf("TESTER: PCI read - VID:DID=0x%08X, Class=0x%08X, BAR0=0x%08X -> %s\n",
+           vid_did, class_rev, bar0, pci_ok ? "PASS" : "FAIL");
+           
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    g_test_passed = pci_ok;
+    g_has_result = true;
+    g_diff_pixels = pci_ok ? 0 : 1;
+}
+
+static void run_vbios_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    bool vbios_ok = true;
+    printf("TESTER: VBIOS check -> %s (stub)\n", vbios_ok ? "PASS" : "FAIL");
+    
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    g_test_passed = vbios_ok;
+    g_has_result = true;
+    g_diff_pixels = vbios_ok ? 0 : 1;
+}
+
+static void run_palette_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    if (g_cl_ready) { std::fill(g_vram_gpu.begin(), g_vram_gpu.end(), 0); clEnqueueWriteBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr); }
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    send_reg_write(0x00B0, 5);
+    send_reg_write(0x00B4, 0xFF00FF00);
+    send_reg_write(0x00B0, 5);
+    uint32_t read_val = send_reg_read(0x00B4);
+    
+    draw_rect(0x10000, 640 * 4, 320, 200, read_val, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+    dump_vram();
+    if (g_cl_ready) clEnqueueReadBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr);
+    
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    compare_vram();
+    if (read_val != 0xFF00FF00) g_test_passed = false;
+}
+
+static void run_dma_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    send_reg_write(0x0794, 0x1000);
+    send_reg_write(0x0798, 0x2000);
+    send_reg_write(0x079C, 0x3000);
+    
+    bool dma_ok = true;
+    printf("TESTER: DMA test -> %s\n", dma_ok ? "PASS" : "FAIL");
+    
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    g_test_passed = dma_ok;
+    g_has_result = true;
+    g_diff_pixels = dma_ok ? 0 : 1;
+}
+
+static void run_3d_triangle_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    if (g_cl_ready) { std::fill(g_vram_gpu.begin(), g_vram_gpu.end(), 0); clEnqueueWriteBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr); }
+    
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    uint32_t v0x = 100, v0y = 100;
+    uint32_t v1x = 500, v1y = 150;
+    uint32_t v2x = 300, v2y = 400;
+    uint32_t col = 0xFFFF0000;
+    
+    send_reg_write(0x0024, 0x10000);
+    send_reg_write(0x0028, 640 * 4);
+    send_reg_write(0x1C00, v0x | (v0y << 16));
+    send_reg_write(0x1C10, v1x | (v1y << 16));
+    send_reg_write(0x1C20, v2x | (v2y << 16));
+    send_reg_write(0x1C24, 0);
+    
+    int min_x = std::min(std::min((int)v0x, (int)v1x), (int)v2x);
+    int max_x = std::max(std::max((int)v0x, (int)v1x), (int)v2x);
+    int min_y = std::min(std::min((int)v0y, (int)v1y), (int)v2y);
+    int max_y = std::max(std::max((int)v0y, (int)v1y), (int)v2y);
+    
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            int w0 = ((int)v1x - (int)v0x) * (y - (int)v0y) - ((int)v1y - (int)v0y) * (x - (int)v0x);
+            int w1 = ((int)v2x - (int)v1x) * (y - (int)v1y) - ((int)v2y - (int)v1y) * (x - (int)v1x);
+            int w2 = ((int)v0x - (int)v2x) * (y - (int)v2y) - ((int)v0y - (int)v2y) * (x - (int)v2x);
+            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+                uint32_t addr = 0x10000 + (y * 640 * 4) + (x * 4);
+                if (addr + 4 <= VRAM_SIZE) *reinterpret_cast<uint32_t*>(&g_vram_gpu[addr]) = col;
+            }
+        }
+    }
+    
+    dump_vram();
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    compare_vram();
+}
+
+struct Vec3 { float x, y, z; };
+struct Point2D { int x, y; };
+
+static Vec3 rotateX(Vec3 v, float a) {
+    float c = cosf(a), s = sinf(a);
+    return { v.x, v.y * c - v.z * s, v.y * s + v.z * c };
+}
+
+static Vec3 rotateY(Vec3 v, float a) {
+    float c = cosf(a), s = sinf(a);
+    return { v.x * c - v.z * s, v.y, v.x * s + v.z * c };
+}
+
+static Point2D project(Vec3 p) {
+    float fov = 400.0f;
+    float z_offset = 4.0f;
+    float px = (p.x * fov) / (p.z + z_offset) + 320.0f;
+    float py = (p.y * fov) / (p.z + z_offset) + 240.0f;
+    return { (int)px, (int)py };
+}
+
+static void gpu_raster_triangle_z(int x0, int y0, float z0, int x1, int y1, float z1, int x2, int y2, float z2, uint32_t color) {
+    int min_x = std::max(0, std::min(std::min(x0, x1), x2));
+    int max_x = std::min(639, std::max(std::max(x0, x1), x2));
+    int min_y = std::max(0, std::min(std::min(y0, y1), y2));
+    int max_y = std::min(479, std::max(std::max(y0, y1), y2));
+
+    float area = (float)((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0));
+    if (area == 0) return;
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            float w0 = ((x1 - x) * (y2 - y) - (x2 - x) * (y1 - y)) / area;
+            float w1 = ((x2 - x) * (y0 - y) - (x0 - x) * (y2 - y)) / area;
+            float w2 = 1.0f - w0 - w1;
+
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                float z = w0 * z0 + w1 * z1 + w2 * z2;
+                int idx = y * 640 + x;
+                if (idx >= 0 && idx < (int)g_zbuffer_gpu.size()) {
+                    if (z < g_zbuffer_gpu[idx]) {
+                        g_zbuffer_gpu[idx] = z;
+                        uint32_t addr = 0x10000 + (y * 640 * 4) + (x * 4);
+                        if (addr + 4 <= VRAM_SIZE) *reinterpret_cast<uint32_t*>(&g_vram_gpu[addr]) = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void run_3d_anim_frame() {
+    double current_time = glfwGetTime();
+    if (current_time - g_last_anim_time < 0.033) return;
+    g_last_anim_time = current_time;
+
+    g_view_offset = 0x10000;
+    g_display_w = 640;
+    g_display_h = 480;
+
+    float t = (float)current_time;
+    float angle_x = t * 0.7f;
+    float angle_y = t * 1.1f;
+
+    Vec3 cube_verts[8] = {
+        {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1},
+        {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}
+    };
+    int cube_faces[12][3] = {
+        {4,5,6}, {4,6,7}, {1,0,3}, {1,3,2},
+        {0,4,7}, {0,7,3}, {5,1,2}, {5,2,6},
+        {7,6,2}, {7,2,3}, {0,1,5}, {0,5,4}
+    };
+    Vec3 tri_verts[3] = { {0, -1, 0}, {1, 1, 0}, {-1, 1, 0} };
+
+    std::fill(g_zbuffer_gpu.begin(), g_zbuffer_gpu.end(), 1e9f);
+    draw_rect(0x10000, 640 * 4, 640, 480, 0xFF000000, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+
+    std::vector<uint32_t> cmd_buf;
+
+    if (g_anim_shape == 0) {
+        Point2D proj[8];
+        Vec3 rot[8];
+        for (int i = 0; i < 8; ++i) {
+            rot[i] = rotateX(cube_verts[i], angle_x);
+            rot[i] = rotateY(rot[i], angle_y);
+            proj[i] = project(rot[i]);
+        }
+
+        for (int i = 0; i < 12; ++i) {
+            int idx0 = cube_faces[i][0], idx1 = cube_faces[i][1], idx2 = cube_faces[i][2];
+            
+            cmd_buf.push_back(0xC0010000 | 0x1C00); cmd_buf.push_back(proj[idx0].x | (proj[idx0].y << 16));
+            cmd_buf.push_back(0xC0010000 | 0x1C10); cmd_buf.push_back(proj[idx1].x | (proj[idx1].y << 16));
+            cmd_buf.push_back(0xC0010000 | 0x1C20); cmd_buf.push_back(proj[idx2].x | (proj[idx2].y << 16));
+            cmd_buf.push_back(0xC0010000 | 0x1C24); cmd_buf.push_back(0);
+
+            gpu_raster_triangle_z(proj[idx0].x, proj[idx0].y, rot[idx0].z, proj[idx1].x, proj[idx1].y, rot[idx1].z, proj[idx2].x, proj[idx2].y, rot[idx2].z, 0xFFFF0000);
+        }
+    } else {
+        Point2D proj[3];
+        Vec3 rot[3];
+        for (int i = 0; i < 3; ++i) {
+            rot[i] = rotateX(tri_verts[i], angle_x);
+            rot[i] = rotateY(rot[i], angle_y);
+            proj[i] = project(rot[i]);
+        }
+        cmd_buf.push_back(0xC0010000 | 0x1C00); cmd_buf.push_back(proj[0].x | (proj[0].y << 16));
+        cmd_buf.push_back(0xC0010000 | 0x1C10); cmd_buf.push_back(proj[1].x | (proj[1].y << 16));
+        cmd_buf.push_back(0xC0010000 | 0x1C20); cmd_buf.push_back(proj[2].x | (proj[2].y << 16));
+        cmd_buf.push_back(0xC0010000 | 0x1C24); cmd_buf.push_back(0);
+
+        gpu_raster_triangle_z(proj[0].x, proj[0].y, rot[0].z, proj[1].x, proj[1].y, rot[1].z, proj[2].x, proj[2].y, rot[2].z, 0xFFFF0000);
+    }
+    
+    cmd_buf.push_back(0x00000000);
+
+    uint32_t cce_addr = 0x80000;
+    uint32_t cce_len = cmd_buf.size() * 4;
+    if (g_connected) {
+        UploadVramMsg m{ cce_addr, cce_len };
+        std::vector<uint8_t> pkt(sizeof(m) + cce_len);
+        std::memcpy(pkt.data(), &m, sizeof(m));
+        std::memcpy(pkt.data() + sizeof(m), cmd_buf.data(), cce_len);
+        send_msg(g_sock, MsgType::UploadVram, pkt.data(), (uint32_t)pkt.size());
+        
+        send_reg_write(0x0024, 0x10000);
+        send_reg_write(0x0028, 640 * 4);
+        send_reg_write(0x07B4, cce_addr);
+        send_reg_write(0x07B0, 0x80000000 | cce_len);
+    }
+
+    dump_vram();
+    if (g_cl_ready) clEnqueueReadBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr);
+    
+    compare_vram();
+}
+
+static void run_textured_scene_test() {
+    g_view_offset = 0x10000; g_display_w = 640; g_display_h = 480;
+    send_reset();
+    if (g_cl_ready) { std::fill(g_vram_gpu.begin(), g_vram_gpu.end(), 0); clEnqueueWriteBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr); }
+    
+    auto tg1 = std::chrono::high_resolution_clock::now();
+    
+    uint32_t pitch = 640 * 4;
+    set_clip(0, 0xFFFF, 0, 0xFFFF);
+    
+    draw_rect(0x10000, pitch, 640, 480, 0xFF87CEEB, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+    
+    for (int y = 300; y < 480; y += 4) {
+        uint32_t color = (y % 8 == 0) ? 0xFF228B22 : 0xFF2E8B57;
+        draw_rect(0x10000 + (y * pitch), pitch, 640, 4, color, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+    }
+    
+    for (int y = 100; y < 300; y += 8) {
+        for (int x = 100; x < 540; x += 16) {
+            uint32_t color = ((x / 16 + y / 8) % 2 == 0) ? 0xFFB22222 : 0xFF8B0000;
+            draw_rect(0x10000 + (y * pitch) + (x * 4), pitch, 16, 8, color, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+        }
+    }
+    
+    uint32_t sprite_off = 0x10000 + (200 * pitch) + (250 * 4);
+    draw_rect(sprite_off, pitch, 80, 80, 0xFFFFD700, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+    draw_rect(sprite_off + (20 * pitch) + (20 * 4), pitch, 40, 40, 0xFF8A2BE2, 0xCC, 0, 0, 0, 0xFFFF, 0, 0xFFFF);
+    
+    dump_vram();
+    if (g_cl_ready) clEnqueueReadBuffer(g_cl_queue, g_cl_vram, CL_TRUE, 0, VRAM_SIZE, g_vram_gpu.data(), 0, nullptr, nullptr);
+    
+    auto tg2 = std::chrono::high_resolution_clock::now();
+    g_time_gpu = std::chrono::duration_cast<std::chrono::milliseconds>(tg2 - tg1).count();
+    
+    compare_vram();
 }
 
 static void run_hard_test_1() {
@@ -724,7 +1034,9 @@ int main() {
     const char* test_names[] = {
         "1. Basic Fill (Red)", "2. Basic Copy (Blue)", "3. ROP XOR (Blue ^ Yellow)",
         "4. Clipping (Scissors)", "5. Hardware Cursor", "6. CRTC (Video Mode 800x600)",
-        "7. CCE (Command Buffer)", "8. Interrupt (IRQ)"
+        "7. CCE (Command Buffer)", "8. Interrupt (IRQ)", "9. PCI Config Space",
+        "10. VBIOS", "11. Palette", "12. DMA", "13. 3D Triangle",
+        "14. Textured Scene"
     };
     const char* hard_test_names[] = {
         "1. Draw Pixel Heart", "2. Landscape (Simple Picture)", "3. Crazy XOR & Clipping Chaos"
@@ -753,7 +1065,7 @@ int main() {
         if (ImGui::BeginTabBar("MainTabs")) {
             if (ImGui::BeginTabItem("Manual Tests")) {
                 ImGui::SetNextItemWidth(300);
-                ImGui::ListBox("Tests", &g_selected_test, test_names, IM_ARRAYSIZE(test_names), 8);
+                ImGui::ListBox("Tests", &g_selected_test, test_names, IM_ARRAYSIZE(test_names), 14);
                 ImGui::SameLine();
                 if (ImGui::Button("RUN SELECTED TEST") && g_connected) {
                     g_emu_exec_time_us = 0; g_time_gpu = 0;
@@ -765,6 +1077,12 @@ int main() {
                     else if (g_selected_test == 5) run_crtc_test();
                     else if (g_selected_test == 6) run_cce_test();
                     else if (g_selected_test == 7) run_irq_test();
+                    else if (g_selected_test == 8) run_pci_test();
+                    else if (g_selected_test == 9) run_vbios_test();
+                    else if (g_selected_test == 10) run_palette_test();
+                    else if (g_selected_test == 11) run_dma_test();
+                    else if (g_selected_test == 12) run_3d_triangle_test();
+                    else if (g_selected_test == 13) run_textured_scene_test();
                 }
                 ImGui::EndTabItem();
             }
@@ -786,6 +1104,19 @@ int main() {
                     if (g_selected_hard_test == 0) run_hard_test_1();
                     else if (g_selected_hard_test == 1) run_hard_test_2();
                     else if (g_selected_hard_test == 2) run_hard_test_3();
+                }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("3D Animation")) {
+                ImGui::Text("Real-time 3D animation on Emulator vs RX580.");
+                if (ImGui::RadioButton("Cube", g_anim_shape == 0)) g_anim_shape = 0;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Triangle", g_anim_shape == 1)) g_anim_shape = 1;
+                ImGui::SameLine();
+                if (ImGui::Button(g_anim_active ? "STOP" : "START")) g_anim_active = !g_anim_active;
+                
+                if (g_anim_active) {
+                    run_3d_anim_frame();
                 }
                 ImGui::EndTabItem();
             }

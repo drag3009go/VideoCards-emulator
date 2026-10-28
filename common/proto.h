@@ -40,6 +40,8 @@ enum class MsgType : uint32_t {
     DumpVramResp = 8,
     UploadVram   = 9,
     Irq          = 10,
+    PciConfigRead  = 11,
+    PciConfigResp  = 12,
 };
 
 #pragma pack(push, 1)
@@ -53,6 +55,8 @@ struct DumpVramMsg     { uint32_t offset; uint32_t len; };
 struct DumpVramRespHdr { uint32_t offset; uint32_t len; uint64_t exec_time_us; };
 struct UploadVramMsg   { uint32_t offset; uint32_t len; };
 struct IrqMsg          { uint32_t status; };
+struct PciConfigReadMsg  { uint32_t reg; };
+struct PciConfigRespMsg  { uint32_t reg; uint32_t value; };
 #pragma pack(pop)
 
 inline bool send_all(socket_t s, const void* data, size_t len) {

@@ -15,6 +15,7 @@ public:
     virtual uint64_t get_exec_time_us() const = 0;
     virtual bool has_pending_irq() const = 0;
     virtual uint32_t pop_pending_irq() = 0;
+    virtual uint32_t pci_config_read(uint32_t reg) = 0;
 };
 
 }

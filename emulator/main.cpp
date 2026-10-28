@@ -1,17 +1,51 @@
 #include "proto.h"
 #include "ivcard.h"
+#include "qemu_proxy.h"
 #include "cards/ati/128/ati128.h"
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <memory>
 
 using namespace vgpu;
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--qemu") == 0) {
+        const char* host = argv[2];
+        int port = std::atoi(argv[3]);
+        auto ati = std::make_unique<ati128::ATI128Card>();
+        ati->set_realistic_timing(false);
+        return run_qemu_proxy(std::move(ati), host, port);
+    }
+
 #ifdef _WIN32
     WsaInit wsa;
 #endif
-    std::unique_ptr<IVideoCard> card = std::make_unique<ati128::ATI128Card>();
+
+    int choice = 0;
+    while (choice < 1 || choice > 2) {
+        printf("\n=== Video Card Emulator ===\n");
+        printf("1. ATI Rage 128 (Realistic 100 MHz)\n");
+        printf("2. ATI Rage 128 (Turbo, Max Speed)\n");
+        printf("Select video card: ");
+        if (scanf("%d", &choice) != 1) {
+            while (getchar() != '\n');
+            choice = 0;
+        }
+    }
+
+    std::unique_ptr<IVideoCard> card;
+    if (choice == 1) {
+        auto ati = std::make_unique<ati128::ATI128Card>();
+        ati->set_realistic_timing(true);
+        card = std::move(ati);
+        printf("[EMU] Loaded: ATI Rage 128 (Realistic Timing)\n");
+    } else {
+        auto ati = std::make_unique<ati128::ATI128Card>();
+        ati->set_realistic_timing(false);
+        card = std::move(ati);
+        printf("[EMU] Loaded: ATI Rage 128 (Turbo Mode)\n");
+    }
 
     socket_t lsock = socket(AF_INET, SOCK_STREAM, 0);
     if (lsock == INVALID_SOCK) { printf("socket fail\n"); return 1; }
@@ -27,7 +61,7 @@ int main() {
     if (bind(lsock, (sockaddr*)&addr, sizeof(addr)) < 0) { printf("bind fail\n"); return 1; }
     if (listen(lsock, 1) < 0) { printf("listen fail\n"); return 1; }
 
-    printf("emulator: listening on port %u (ATI Rage 128)\n", (unsigned)DEFAULT_PORT);
+    printf("emulator: listening on port %u\n", (unsigned)DEFAULT_PORT);
     fflush(stdout);
 
     socket_t client = accept(lsock, nullptr, nullptr);
@@ -74,6 +108,12 @@ int main() {
                 send_msg(client, MsgType::RegReadResp, &resp, sizeof(resp));
                 break;
             }
+            case MsgType::PciConfigRead: {
+                PciConfigReadMsg r; std::memcpy(&r, buf.data(), sizeof(r));
+                PciConfigRespMsg resp{ r.reg, card->pci_config_read(r.reg) };
+                send_msg(client, MsgType::PciConfigResp, &resp, sizeof(resp));
+                break;
+            }
             case MsgType::DumpVram: {
                 DumpVramMsg r; std::memcpy(&r, buf.data(), sizeof(r));
                 std::vector<uint8_t> out(r.len);
@@ -83,19 +123,14 @@ int main() {
                 send_all(client, &msg_hdr, sizeof(msg_hdr));
                 send_all(client, &resp, sizeof(resp));
                 send_all(client, out.data(), r.len);
-                printf("emulator: DUMP %u bytes @ %08x | Exec Time: %llu us\n", r.len, r.offset, (unsigned long long)resp.exec_time_us);
-                fflush(stdout);
                 break;
             }
             case MsgType::UploadVram: {
                 UploadVramMsg r; std::memcpy(&r, buf.data(), sizeof(r));
                 card->upload_vram(r.offset, r.len, buf.data() + sizeof(r));
-                printf("emulator: UPLOAD %u bytes to VRAM @ %08x\n", r.len, r.offset);
-                fflush(stdout);
                 break;
             }
-            default:
-                break;
+            default: break;
         }
     }
 

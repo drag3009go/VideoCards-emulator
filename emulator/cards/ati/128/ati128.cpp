@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <thread>
+#include <cmath>
 
 namespace vgpu::ati128 {
 
@@ -34,13 +36,54 @@ constexpr uint32_t REG_CUR_CNTL          = 0x1480;
 constexpr uint32_t REG_DST_WIDTH_X       = 0x1588;
 constexpr uint32_t REG_DST_HEIGHT_Y      = 0x15a0;
 
+constexpr uint32_t REG_VTX0_X            = 0x1C00;
+constexpr uint32_t REG_VTX0_Y            = 0x1C04;
+constexpr uint32_t REG_VTX0_C            = 0x1C08;
+constexpr uint32_t REG_VTX1_X            = 0x1C10;
+constexpr uint32_t REG_VTX1_Y            = 0x1C14;
+constexpr uint32_t REG_VTX1_C            = 0x1C18;
+constexpr uint32_t REG_VTX2_X            = 0x1C20;
+constexpr uint32_t REG_VTX2_Y            = 0x1C24;
+constexpr uint32_t REG_VTX2_C            = 0x1C28;
+
+constexpr uint32_t REG_PALETTE_INDEX     = 0x00b0;
+constexpr uint32_t REG_PALETTE_DATA      = 0x00b4;
+
+constexpr uint32_t REG_PM4_FPU_DMAJOR01  = 0x0794;
+constexpr uint32_t REG_PM4_FPU_DMAJOR12  = 0x0798;
+constexpr uint32_t REG_PM4_FPU_DMAJOR02  = 0x079c;
+
 constexpr uint32_t IRQ_GUI_IDLE = 0x01;
 
 ATI128Card::ATI128Card()
-    : vram(VRAM_SIZE, 0), regs(MMIO_REGS / 4, 0) {}
+    : vram(VRAM_SIZE, 0), regs(MMIO_REGS / 4, 0), zbuffer(640 * 480, 1e9f) {
+    pci_config[0] = 0x52461002;
+    pci_config[1] = 0x04000000;
+    pci_config[2] = 0x03000000;
+    pci_config[3] = 0x00000000;
+    pci_config[4] = 0xE0000000;
+    pci_config[5] = 0x00000000;
+    pci_config[6] = 0xE1000000;
+    pci_config[7] = 0x00000000;
+    pci_config[8] = 0x00000000;
+    pci_config[9] = 0x00000000;
+    pci_config[10] = 0x00000000;
+    pci_config[11] = 0x00000000;
+    pci_config[12] = 0x00000000;
+    pci_config[13] = 0x00000000;
+    pci_config[14] = 0x00000000;
+    pci_config[15] = 0x00000100;
+
+    vbios.resize(64 * 1024, 0xFF);
+    vbios[0] = 0x55;
+    vbios[1] = 0xAA;
+    vbios[2] = 0x40;
+    vbios[0x18] = 0x00; vbios[0x19] = 0x00;
+}
 
 void ATI128Card::reset() {
     std::fill(vram.begin(), vram.end(), 0);
+    std::fill(zbuffer.begin(), zbuffer.end(), 1e9f);
     std::fill(regs.begin(), regs.end(), 0);
     latch_src_offset = 0;
     latch_src_pitch = 0;
@@ -70,6 +113,14 @@ void ATI128Card::reset() {
     gen_int_status = 0;
     pending_irqs.clear();
     total_exec_time_us = 0;
+    palette_index = 0;
+    std::fill(std::begin(palette_ram), std::end(palette_ram), 0);
+    vc_prim_type = 0;
+    vc_cntl = 0;
+    vtx_count = 0;
+    dma_major01 = 0;
+    dma_major12 = 0;
+    dma_major02 = 0;
 }
 
 uint32_t ATI128Card::pop_pending_irq() {
@@ -86,9 +137,15 @@ void ATI128Card::trigger_irq(uint32_t bit) {
     }
 }
 
+uint32_t ATI128Card::pci_config_read(uint32_t reg) {
+    if (reg >= 64) return 0xFFFFFFFF;
+    return pci_config[reg];
+}
+
 uint32_t ATI128Card::reg_read(uint32_t addr) {
     if (addr + 4 > MMIO_REGS) return 0xFFFFFFFFu;
     if (addr == REG_GEN_INT_STATUS) return gen_int_status;
+    if (addr == REG_PALETTE_DATA) return palette_ram[palette_index];
     return regs[addr / 4];
 }
 
@@ -140,12 +197,38 @@ void ATI128Card::reg_write(uint32_t addr, uint32_t value) {
             trigger_irq(IRQ_GUI_IDLE);
         }
     }
+    else if (addr == REG_PALETTE_INDEX) {
+        palette_index = value & 0xFF;
+    }
+    else if (addr == REG_PALETTE_DATA) {
+        write_palette(palette_index, value);
+        palette_index = (palette_index + 1) & 0xFF;
+    }
+    else if (addr == REG_PM4_FPU_DMAJOR01) dma_major01 = value;
+    else if (addr == REG_PM4_FPU_DMAJOR12) dma_major12 = value;
+    else if (addr == REG_PM4_FPU_DMAJOR02) dma_major02 = value;
+    else if (addr >= REG_VTX0_X && addr <= REG_VTX2_C) {
+        int idx = (addr - REG_VTX0_X) / 0x10;
+        int field = ((addr - REG_VTX0_X) % 0x10) / 4;
+        if (idx < 3 && field < 3) {
+            vtx[idx][field] = value;
+            if (idx == 2 && field == 1) {
+                rasterize_triangle(vtx[0][0], vtx[1][0], vtx[2][0]);
+                vtx_count = 0;
+            }
+        }
+    }
+}
+
+void ATI128Card::write_palette(uint32_t index, uint32_t rgb) {
+    if (index < 256) {
+        palette_ram[index] = rgb & 0xFFFFFF;
+    }
 }
 
 void ATI128Card::process_cce() {
-    printf("[EMU] CCE: Processing command buffer at 0x%08X\n", cce_buf_addr);
     uint32_t ptr = cce_buf_addr;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 100; ++i) {
         if (ptr + 4 > VRAM_SIZE) break;
         uint32_t header = *reinterpret_cast<uint32_t*>(&vram[ptr]);
         if (header == 0x00000000) break;
@@ -161,7 +244,6 @@ void ATI128Card::process_cce() {
             }
         } else break;
     }
-    printf("[EMU] CCE: Finished processing buffer.\n");
 }
 
 void ATI128Card::perform_fill(int start_x, int start_y) {
@@ -184,6 +266,16 @@ void ATI128Card::perform_fill(int start_x, int start_y) {
     }
     auto t2 = std::chrono::high_resolution_clock::now();
     total_exec_time_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+
+    if (realistic_timing) {
+        uint64_t pixels = latch_width * latch_height;
+        uint64_t cycles = pixels * 32;
+        uint64_t time_ns = cycles * 10;
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        if (time_ns > elapsed_ns) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(time_ns - elapsed_ns));
+        }
+    }
 }
 
 void ATI128Card::perform_copy(int start_x, int start_y) {
@@ -209,6 +301,61 @@ void ATI128Card::perform_copy(int start_x, int start_y) {
     }
     auto t2 = std::chrono::high_resolution_clock::now();
     total_exec_time_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+
+    if (realistic_timing) {
+        uint64_t pixels = latch_width * latch_height;
+        uint64_t cycles = pixels * 64;
+        uint64_t time_ns = cycles * 10;
+        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        if (time_ns > elapsed_ns) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(time_ns - elapsed_ns));
+        }
+    }
+}
+
+void ATI128Card::rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2) {
+    float x0 = (float)(v0 & 0xFFFF);
+    float y0 = (float)((v0 >> 16) & 0xFFFF);
+    float z0 = 0.5f;
+    
+    float x1 = (float)(v1 & 0xFFFF);
+    float y1 = (float)((v1 >> 16) & 0xFFFF);
+    float z1 = 0.6f;
+    
+    float x2 = (float)(v2 & 0xFFFF);
+    float y2 = (float)((v2 >> 16) & 0xFFFF);
+    float z2 = 0.7f;
+
+    uint32_t c0 = 0xFFFF0000;
+
+    int min_x = std::max(0, (int)std::min(std::min(x0, x1), x2));
+    int max_x = std::min((int)crtc_h_total_disp, (int)std::max(std::max(x0, x1), x2));
+    int min_y = std::max(0, (int)std::min(std::min(y0, y1), y2));
+    int max_y = std::min((int)crtc_v_total_disp, (int)std::max(std::max(y0, y1), y2));
+
+    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            float w0 = ((x1 - x) * (y2 - y) - (x2 - x) * (y1 - y)) / area;
+            float w1 = ((x2 - x) * (y0 - y) - (x0 - x) * (y2 - y)) / area;
+            float w2 = 1.0f - w0 - w1;
+
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                float z = w0 * z0 + w1 * z1 + w2 * z2;
+                int idx = y * crtc_h_total_disp + x;
+                if (idx >= 0 && idx < (int)zbuffer.size()) {
+                    if (z < zbuffer[idx]) {
+                        zbuffer[idx] = z;
+                        uint32_t addr = crtc_offset + (y * crtc_pitch) + (x * 4);
+                        if (addr + 4 <= VRAM_SIZE) {
+                            *reinterpret_cast<uint32_t*>(&vram[addr]) = c0;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void ATI128Card::dump_vram(uint32_t offset, uint32_t len, uint8_t* out) const {

@@ -18,14 +18,20 @@ public:
     uint64_t get_exec_time_us() const override { return total_exec_time_us; }
     bool has_pending_irq() const override { return !pending_irqs.empty(); }
     uint32_t pop_pending_irq() override;
+    uint32_t pci_config_read(uint32_t reg) override;
+
+    void set_realistic_timing(bool enable) { realistic_timing = enable; }
 
 private:
     void perform_fill(int start_x, int start_y);
     void perform_copy(int start_x, int start_y);
     void process_cce();
     void trigger_irq(uint32_t bit);
+    void rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2);
+    void write_palette(uint32_t index, uint32_t rgb);
 
     std::vector<uint8_t> vram;
+    std::vector<float> zbuffer;
     std::vector<uint32_t> regs;
 
     uint32_t latch_src_offset = 0;
@@ -61,8 +67,24 @@ private:
     uint32_t gen_int_cntl = 0;
     uint32_t gen_int_status = 0;
 
+    uint32_t pci_config[64] = {0};
+    std::vector<uint8_t> vbios;
+
+    uint8_t palette_index = 0;
+    uint32_t palette_ram[256] = {0};
+
+    uint32_t vc_prim_type = 0;
+    uint32_t vc_cntl = 0;
+    uint32_t vtx[3][3] = {{0}};
+    int vtx_count = 0;
+
+    uint32_t dma_major01 = 0;
+    uint32_t dma_major12 = 0;
+    uint32_t dma_major02 = 0;
+
     std::vector<uint32_t> pending_irqs;
     uint64_t total_exec_time_us = 0;
+    bool realistic_timing = false;
 };
 
 }

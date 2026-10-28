@@ -39,6 +39,7 @@ find_package(OpenGL REQUIRED)
 
 add_executable(emulator
     emulator/main.cpp
+    emulator/qemu_proxy.cpp
     emulator/cards/ati/128/ati128.cpp
 )
 target_include_directories(emulator PRIVATE common emulator)
