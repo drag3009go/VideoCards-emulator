@@ -39,7 +39,17 @@ int main() {
     MsgType type;
     uint32_t len;
 
-    while (recv_msg(client, type, buf.data(), (uint32_t)buf.size(), len)) {
+    while (true) {
+        while (card->has_pending_irq()) {
+            uint32_t irq = card->pop_pending_irq();
+            IrqMsg m{ irq };
+            send_msg(client, MsgType::Irq, &m, sizeof(m));
+            printf("emulator: IRQ sent (status=0x%08X)\n", irq);
+            fflush(stdout);
+        }
+
+        if (!recv_msg(client, type, buf.data(), (uint32_t)buf.size(), len)) break;
+
         switch (type) {
             case MsgType::Ping: {
                 PingMsg p; std::memcpy(&p, buf.data(), sizeof(p));
@@ -56,8 +66,6 @@ int main() {
             case MsgType::RegWrite: {
                 RegWriteMsg r; std::memcpy(&r, buf.data(), sizeof(r));
                 card->reg_write(r.addr, r.value);
-                printf("emulator: REG[%04x] <= %08x\n", r.addr, r.value);
-                fflush(stdout);
                 break;
             }
             case MsgType::RegRead: {
@@ -70,8 +78,12 @@ int main() {
                 DumpVramMsg r; std::memcpy(&r, buf.data(), sizeof(r));
                 std::vector<uint8_t> out(r.len);
                 card->dump_vram(r.offset, r.len, out.data());
-                send_msg(client, MsgType::DumpVramResp, out.data(), r.len);
-                printf("emulator: DUMP %u bytes @ %08x\n", r.len, r.offset);
+                DumpVramRespHdr resp{ r.offset, r.len, card->get_exec_time_us() };
+                MsgHeader msg_hdr{ (uint32_t)MsgType::DumpVramResp, (uint32_t)(sizeof(resp) + r.len) };
+                send_all(client, &msg_hdr, sizeof(msg_hdr));
+                send_all(client, &resp, sizeof(resp));
+                send_all(client, out.data(), r.len);
+                printf("emulator: DUMP %u bytes @ %08x | Exec Time: %llu us\n", r.len, r.offset, (unsigned long long)resp.exec_time_us);
                 fflush(stdout);
                 break;
             }

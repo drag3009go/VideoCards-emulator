@@ -15,11 +15,15 @@ public:
     void reg_write(uint32_t addr, uint32_t value) override;
     void dump_vram(uint32_t offset, uint32_t len, uint8_t* out) const override;
     void upload_vram(uint32_t offset, uint32_t len, const uint8_t* data) override;
+    uint64_t get_exec_time_us() const override { return total_exec_time_us; }
+    bool has_pending_irq() const override { return !pending_irqs.empty(); }
+    uint32_t pop_pending_irq() override;
 
 private:
     void perform_fill(int start_x, int start_y);
     void perform_copy(int start_x, int start_y);
     void process_cce();
+    void trigger_irq(uint32_t bit);
 
     std::vector<uint8_t> vram;
     std::vector<uint32_t> regs;
@@ -53,6 +57,12 @@ private:
 
     uint32_t cce_buf_addr = 0;
     uint32_t cce_buf_size = 0;
+
+    uint32_t gen_int_cntl = 0;
+    uint32_t gen_int_status = 0;
+
+    std::vector<uint32_t> pending_irqs;
+    uint64_t total_exec_time_us = 0;
 };
 
 }
