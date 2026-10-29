@@ -1,0 +1,110 @@
+{
+  "format_version": 1,
+  "name": "ATI Rage 128",
+  "author": "dragon",
+  "description": "2D/3D видеоадаптер ATI Rage 128",
+
+  "pci": {
+    "vendor_id": 4098,
+    "device_id": 21062,
+    "class_code": 196608,
+    "revision": 0,
+    "subsystem_vendor_id": 4098,
+    "subsystem_id": 0,
+    "bars": [
+      { "index": 0, "type": "vram", "size": 67108864, "prefetch": true },
+      { "index": 2, "type": "mmio", "size": 8192, "prefetch": false }
+    ]
+  },
+
+  "vram_size": 67108864,
+  "mmio_size": 8192,
+
+  "default_crtc": {
+    "h_total_disp": 640,
+    "v_total_disp": 480,
+    "offset": 0,
+    "pitch": 2560
+  },
+
+  "registers": {
+    "CRTC_OFFSET":        36,
+    "CRTC_PITCH":         40,
+    "CRTC_H_TOTAL_DISP":  80,
+    "CRTC_V_TOTAL_DISP":  84,
+    "GEN_INT_CNTL":       256,
+    "GEN_INT_STATUS":     260,
+    "GEN_INT_ACK":        264,
+    "DP_GUI_MASTER_CNTL": 5236,
+    "DP_BRUSH_FRGD_CLR":  5244,
+    "DP_MIX":             5144,
+    "DST_OFFSET":         5124,
+    "DST_PITCH":          5128,
+    "SRC_OFFSET":         5120,
+    "SRC_PITCH":          5132,
+    "DST_WIDTH_X":        5512,
+    "DST_HEIGHT_Y":       5536,
+    "DST_Y_X":            5176,
+    "SC_LEFT":            5184,
+    "SC_RIGHT":           5188,
+    "SC_TOP":             5192,
+    "SC_BOTTOM":          5196,
+    "CUR_OFFSET":         5232,
+    "CUR_POS":            5236,
+    "CUR_CNTL":           5248
+  },
+
+  "latch": [
+    {
+      "on_write": "DP_GUI_MASTER_CNTL",
+      "when": "(value & 0x2) == 0",
+      "capture": ["DST_OFFSET", "DST_PITCH", "SRC_OFFSET", "SRC_PITCH"]
+    }
+  ],
+
+  "operations": [
+    {
+      "type": "fill",
+      "trigger": "DST_Y_X",
+      "condition": "(reg(DP_GUI_MASTER_CNTL) & 0x80000000) != 0",
+      "params": {
+        "dst_offset": "DST_OFFSET",
+        "dst_pitch":  "DST_PITCH",
+        "width":      "DST_WIDTH_X",
+        "height":     "DST_HEIGHT_Y",
+        "color":      "DP_BRUSH_FRGD_CLR",
+        "rop":        "DP_MIX"
+      },
+      "clip": { "left": "SC_LEFT", "right": "SC_RIGHT", "top": "SC_TOP", "bottom": "SC_BOTTOM" }
+    },
+    {
+      "type": "copy",
+      "trigger": "DST_Y_X",
+      "condition": "(reg(DP_GUI_MASTER_CNTL) & 0x00010000) != 0",
+      "params": {
+        "src_offset": "SRC_OFFSET",
+        "src_pitch":  "SRC_PITCH",
+        "dst_offset": "DST_OFFSET",
+        "dst_pitch":  "DST_PITCH",
+        "width":      "DST_WIDTH_X",
+        "height":     "DST_HEIGHT_Y",
+        "rop":        "DP_MIX"
+      },
+      "clip": { "left": "SC_LEFT", "right": "SC_RIGHT", "top": "SC_TOP", "bottom": "SC_BOTTOM" }
+    }
+  ],
+
+  "irq": {
+    "idle_bit": 1,
+    "on_operation_done": true
+  },
+
+  "cursor": {
+    "offset_reg": "CUR_OFFSET",
+    "pos_reg":    "CUR_POS",
+    "enable_reg": "CUR_CNTL",
+    "size": 32
+  },
+
+  "extensions": {}
+}

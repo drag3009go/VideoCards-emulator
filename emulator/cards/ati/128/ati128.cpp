@@ -1,5 +1,6 @@
 #include "ati128.h"
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -56,7 +57,10 @@ constexpr uint32_t REG_PM4_FPU_DMAJOR02  = 0x079c;
 constexpr uint32_t IRQ_GUI_IDLE = 0x01;
 
 ATI128Card::ATI128Card()
-    : vram(VRAM_SIZE, 0), regs(MMIO_REGS / 4, 0), zbuffer(640 * 480, 1e9f) {
+    : vram_owned(true), regs(MMIO_REGS / 4, 0), zbuffer(640 * 480, 1e9f) {
+    vram = (uint8_t*)std::malloc(VRAM_SIZE);
+    std::memset(vram, 0, VRAM_SIZE);
+
     pci_config[0] = 0x52461002;
     pci_config[1] = 0x04000000;
     pci_config[2] = 0x03000000;
@@ -81,8 +85,18 @@ ATI128Card::ATI128Card()
     vbios[0x18] = 0x00; vbios[0x19] = 0x00;
 }
 
+ATI128Card::~ATI128Card() {
+    if (vram_owned && vram) std::free(vram);
+}
+
+void ATI128Card::attach_shared(uint8_t* vram_ptr) {
+    if (vram_owned && vram) std::free(vram);
+    vram = vram_ptr;
+    vram_owned = false;
+}
+
 void ATI128Card::reset() {
-    std::fill(vram.begin(), vram.end(), 0);
+    std::memset(vram, 0, VRAM_SIZE);
     std::fill(zbuffer.begin(), zbuffer.end(), 1e9f);
     std::fill(regs.begin(), regs.end(), 0);
     latch_src_offset = 0;
@@ -317,11 +331,11 @@ void ATI128Card::rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2) {
     float x0 = (float)(v0 & 0xFFFF);
     float y0 = (float)((v0 >> 16) & 0xFFFF);
     float z0 = 0.5f;
-    
+
     float x1 = (float)(v1 & 0xFFFF);
     float y1 = (float)((v1 >> 16) & 0xFFFF);
     float z1 = 0.6f;
-    
+
     float x2 = (float)(v2 & 0xFFFF);
     float y2 = (float)((v2 >> 16) & 0xFFFF);
     float z2 = 0.7f;
@@ -334,6 +348,7 @@ void ATI128Card::rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2) {
     int max_y = std::min((int)crtc_v_total_disp, (int)std::max(std::max(y0, y1), y2));
 
     float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area == 0) return;
 
     for (int y = min_y; y <= max_y; ++y) {
         for (int x = min_x; x <= max_x; ++x) {
@@ -361,7 +376,7 @@ void ATI128Card::rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2) {
 void ATI128Card::dump_vram(uint32_t offset, uint32_t len, uint8_t* out) const {
     if (offset >= VRAM_SIZE) return;
     if ((size_t)offset + len > VRAM_SIZE) len = (uint32_t)(VRAM_SIZE - offset);
-    std::memcpy(out, vram.data() + offset, len);
+    std::memcpy(out, vram + offset, len);
     if (cur_enabled) {
         for (int cy = 0; cy < 32; ++cy) {
             for (int cx = 0; cx < 32; ++cx) {
@@ -385,7 +400,7 @@ void ATI128Card::dump_vram(uint32_t offset, uint32_t len, uint8_t* out) const {
 
 void ATI128Card::upload_vram(uint32_t offset, uint32_t len, const uint8_t* data) {
     if (offset + len <= VRAM_SIZE) {
-        std::memcpy(vram.data() + offset, data, len);
+        std::memcpy(vram + offset, data, len);
     }
 }
 

@@ -8,7 +8,7 @@ namespace vgpu::ati128 {
 class ATI128Card : public IVideoCard {
 public:
     ATI128Card();
-    virtual ~ATI128Card() = default;
+    virtual ~ATI128Card();
 
     void reset() override;
     uint32_t reg_read(uint32_t addr) override;
@@ -20,6 +20,7 @@ public:
     uint32_t pop_pending_irq() override;
     uint32_t pci_config_read(uint32_t reg) override;
 
+    void attach_shared(uint8_t* vram_ptr);
     void set_realistic_timing(bool enable) { realistic_timing = enable; }
 
 private:
@@ -30,7 +31,8 @@ private:
     void rasterize_triangle(uint32_t v0, uint32_t v1, uint32_t v2);
     void write_palette(uint32_t index, uint32_t rgb);
 
-    std::vector<uint8_t> vram;
+    uint8_t* vram = nullptr;
+    bool vram_owned = true;
     std::vector<float> zbuffer;
     std::vector<uint32_t> regs;
 

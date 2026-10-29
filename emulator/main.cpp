@@ -2,14 +2,249 @@
 #include "ivcard.h"
 #include "qemu_proxy.h"
 #include "cards/ati/128/ati128.h"
+#include "cards/generic/generic_card.h"
+#include "../common/vgpu_format.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <memory>
+#include <thread>
+#include <chrono>
+#include <string>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#endif
 
 using namespace vgpu;
 
+static std::unique_ptr<IVideoCard> g_card;
+static std::string g_current_name = "(built-in ATI Rage 128)";
+
+static std::unique_ptr<IVideoCard> create_builtin() {
+    auto ati = std::make_unique<ati128::ATI128Card>();
+    ati->set_realistic_timing(false);
+    return ati;
+}
+
+static std::unique_ptr<IVideoCard> load_vgpu(const std::string& path) {
+    auto def = VgpuDefinition::load(path);
+    printf("[menu] loaded: %s (VID=0x%04X DID=0x%04X vram=%llu mmio=%llu)\n",
+           def.name.c_str(), def.pci.vendor_id, def.pci.device_id,
+           (unsigned long long)def.vram_size, (unsigned long long)def.mmio_size);
+    return std::make_unique<generic::GenericCard>(def);
+}
+
+#ifndef _WIN32
+static bool run_shm_mode(const std::string& vram_path, const std::string& mmio_path) {
+    printf("[shm] waiting for QEMU to create:\n");
+    printf("[shm]   vram: %s\n", vram_path.c_str());
+    printf("[shm]   mmio: %s\n", mmio_path.c_str());
+    printf("[shm] press Ctrl+C to cancel\n");
+
+    int fdv = -1, fdm = -1;
+    int waited_ms = 0;
+    while (true) {
+        fdv = open(vram_path.c_str(), O_RDWR);
+        fdm = open(mmio_path.c_str(), O_RDWR);
+
+        if (fdv >= 0 && fdm >= 0) {
+            // Проверим, что файлы уже нужного размера (QEMU truncate их)
+            struct stat st_v, st_m;
+            if (fstat(fdv, &st_v) == 0 && fstat(fdm, &st_m) == 0
+                && st_v.st_size >= 64LL * 1024 * 1024
+                && st_m.st_size >= 8192) {
+                printf("[shm] files ready (vram=%lld, mmio=%lld)\n",
+                       (long long)st_v.st_size, (long long)st_m.st_size);
+                break;
+            }
+            // файлы есть, но ещё не готовы (QEMU в процессе)
+            if (fdv >= 0) close(fdv);
+            if (fdm >= 0) close(fdm);
+            fdv = fdm = -1;
+        } else {
+            if (fdv >= 0) { close(fdv); fdv = -1; }
+            if (fdm >= 0) { close(fdm); fdm = -1; }
+        }
+
+        if (waited_ms % 2000 == 0) {
+            printf("[shm] still waiting (%d s)...\n", waited_ms / 1000);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        waited_ms += 500;
+    }
+
+
+
+    uint64_t vs = 64ULL * 1024 * 1024;
+    uint64_t ms = 8192;
+    uint8_t* vram = (uint8_t*)mmap(nullptr, vs, PROT_READ | PROT_WRITE, MAP_SHARED, fdv, 0);
+    uint8_t* mmio = (uint8_t*)mmap(nullptr, ms, PROT_READ | PROT_WRITE, MAP_SHARED, fdm, 0);
+    close(fdv);
+    close(fdm);
+
+    if (vram == MAP_FAILED || mmio == MAP_FAILED) {
+        printf("ERROR: mmap failed\n");
+        return false;
+    }
+
+    if (auto* ati = dynamic_cast<ati128::ATI128Card*>(g_card.get())) {
+        ati->attach_shared(vram);
+    } else if (auto* gen = dynamic_cast<generic::GenericCard*>(g_card.get())) {
+        gen->attach_shared(vram);
+    } else {
+        printf("ERROR: card type does not support SHM\n");
+        return false;
+    }
+
+    printf("[shm] attached vram=%p mmio=%p\n", vram, mmio);
+    printf("[shm] waiting for guest writes to MMIO...\n");
+
+    std::vector<uint32_t> last_mmio(ms / 4, 0);
+    uint64_t last_vram_hash = 0;
+    auto last_log = std::chrono::steady_clock::now();
+    int mmio_writes = 0, triggers = 0;
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (uint32_t off = 0; off < ms; off += 4) {
+            uint32_t val = *(uint32_t*)(mmio + off);
+            if (val != last_mmio[off / 4]) {
+                last_mmio[off / 4] = val;
+                g_card->reg_write(off, val);
+                mmio_writes++;
+                if (off == 0x1438) triggers++;
+            }
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 1000) {
+            last_log = now;
+            uint64_t hash = 0;
+            for (size_t i = 0; i < vs; i += 4096) {
+                hash ^= *reinterpret_cast<uint32_t*>(vram + i);
+            }
+            const char* status = (hash != last_vram_hash) ? "VRAM CHANGED" : "idle";
+            printf("[shm] 1s: %d MMIO, %d cmd, %s\n", mmio_writes, triggers, status);
+            last_vram_hash = hash;
+            mmio_writes = 0;
+            triggers = 0;
+        }
+    }
+    return true;
+}
+#endif
+
+static std::vector<std::string> list_vgpu_files() {
+    std::vector<std::string> out;
+#ifndef _WIN32
+    const char* home = std::getenv("HOME");
+    std::string dir = home ? std::string(home) + "/vgpu/cards" : "cards";
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        // fallback: ищем в текущей папке cards/
+        d = opendir("cards");
+        dir = "cards";
+        if (!d) return out;
+    }
+    struct dirent* ent;
+    while ((ent = readdir(d))) {
+        std::string name = ent->d_name;
+        if (name.size() > 5 && name.substr(name.size() - 5) == ".vgpu") {
+            out.push_back(dir + "/" + name);
+        }
+    }
+    closedir(d);
+#endif
+    return out;
+}
+
+static void select_vgpu() {
+    auto files = list_vgpu_files();
+    if (files.empty()) {
+        printf("\n[menu] no .vgpu files found (looking in ~/vgpu/cards/ and ./cards/)\n");
+        return;
+    }
+    printf("\n[menu] Available .vgpu cards:\n");
+    for (size_t i = 0; i < files.size(); ++i)
+        printf("  [%zu] %s\n", i + 1, files[i].c_str());
+    printf("  [0] Cancel\n");
+    printf("Choice: ");
+
+    int c = 0;
+    if (scanf("%d", &c) != 1) { while (getchar() != '\n'); return; }
+    if (c < 1 || c > (int)files.size()) return;
+
+    try {
+        g_card = load_vgpu(files[c - 1]);
+        g_current_name = files[c - 1];
+        printf("[menu] loaded: %s\n", g_current_name.c_str());
+        printf("[menu] NOTE: запусти QEMU с --device vgpu-proxy,\n");
+        printf("       VID/DID взяты из .vgpu файла\n");
+    } catch (std::exception& e) {
+        printf("[menu] ERROR loading .vgpu: %s\n", e.what());
+    }
+}
+
+static void interactive_menu() {
+    if (!g_card) g_card = create_builtin();
+
+    while (true) {
+        printf("\n=== VGPU Emulator ===\n");
+        printf("Current card: %s\n", g_current_name.c_str());
+        printf("  1. Start (QEMU shared memory)\n");
+        printf("  2. Select VGPU card (.vgpu file)\n");
+        printf("  3. Exit\n");
+        printf("Choice: ");
+
+        int c = 0;
+        if (scanf("%d", &c) != 1) { while (getchar() != '\n'); c = 0; }
+        if (c == 1) {
+#ifndef _WIN32
+            run_shm_mode("/dev/shm/vgpu_vram", "/dev/shm/vgpu_mmio");
+#else
+            printf("[menu] SHM mode is Linux-only\n");
+#endif
+        } else if (c == 2) {
+            select_vgpu();
+        } else if (c == 3) {
+            return;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    if (argc >= 2 && std::strcmp(argv[1], "--shm") == 0) {
+        std::string vgpu_path;
+        std::string vp = "/dev/shm/vgpu_vram";
+        std::string mp = "/dev/shm/vgpu_mmio";
+
+        for (int i = 2; i < argc - 1; ++i) {
+            if (std::strcmp(argv[i], "--vgpu") == 0) vgpu_path = argv[i + 1];
+            if (std::strcmp(argv[i], "--vram") == 0) vp = argv[i + 1];
+            if (std::strcmp(argv[i], "--mmio") == 0) mp = argv[i + 1];
+        }
+        try {
+            if (!vgpu_path.empty()) {
+                g_card = load_vgpu(vgpu_path);
+                g_current_name = vgpu_path;
+            } else {
+                g_card = create_builtin();
+            }
+        } catch (std::exception& e) {
+            printf("ERROR: %s\n", e.what());
+            return 1;
+        }
+        run_shm_mode(vp, mp);
+        return 0;
+    }
+#endif
+
     if (argc >= 4 && std::strcmp(argv[1], "--qemu") == 0) {
         const char* host = argv[2];
         int port = std::atoi(argv[3]);
@@ -22,119 +257,6 @@ int main(int argc, char** argv) {
     WsaInit wsa;
 #endif
 
-    int choice = 0;
-    while (choice < 1 || choice > 2) {
-        printf("\n=== Video Card Emulator ===\n");
-        printf("1. ATI Rage 128 (Realistic 100 MHz)\n");
-        printf("2. ATI Rage 128 (Turbo, Max Speed)\n");
-        printf("Select video card: ");
-        if (scanf("%d", &choice) != 1) {
-            while (getchar() != '\n');
-            choice = 0;
-        }
-    }
-
-    std::unique_ptr<IVideoCard> card;
-    if (choice == 1) {
-        auto ati = std::make_unique<ati128::ATI128Card>();
-        ati->set_realistic_timing(true);
-        card = std::move(ati);
-        printf("[EMU] Loaded: ATI Rage 128 (Realistic Timing)\n");
-    } else {
-        auto ati = std::make_unique<ati128::ATI128Card>();
-        ati->set_realistic_timing(false);
-        card = std::move(ati);
-        printf("[EMU] Loaded: ATI Rage 128 (Turbo Mode)\n");
-    }
-
-    socket_t lsock = socket(AF_INET, SOCK_STREAM, 0);
-    if (lsock == INVALID_SOCK) { printf("socket fail\n"); return 1; }
-
-    int opt = 1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(DEFAULT_PORT);
-
-    if (bind(lsock, (sockaddr*)&addr, sizeof(addr)) < 0) { printf("bind fail\n"); return 1; }
-    if (listen(lsock, 1) < 0) { printf("listen fail\n"); return 1; }
-
-    printf("emulator: listening on port %u\n", (unsigned)DEFAULT_PORT);
-    fflush(stdout);
-
-    socket_t client = accept(lsock, nullptr, nullptr);
-    if (client == INVALID_SOCK) { printf("accept fail\n"); return 1; }
-    printf("emulator: tester connected\n");
-    fflush(stdout);
-
-    std::vector<uint8_t> buf(VRAM_SIZE);
-    MsgType type;
-    uint32_t len;
-
-    while (true) {
-        while (card->has_pending_irq()) {
-            uint32_t irq = card->pop_pending_irq();
-            IrqMsg m{ irq };
-            send_msg(client, MsgType::Irq, &m, sizeof(m));
-            printf("emulator: IRQ sent (status=0x%08X)\n", irq);
-            fflush(stdout);
-        }
-
-        if (!recv_msg(client, type, buf.data(), (uint32_t)buf.size(), len)) break;
-
-        switch (type) {
-            case MsgType::Ping: {
-                PingMsg p; std::memcpy(&p, buf.data(), sizeof(p));
-                send_msg(client, MsgType::Pong, &p, sizeof(p));
-                break;
-            }
-            case MsgType::Reset: {
-                card->reset();
-                send_msg(client, MsgType::Pong, nullptr, 0);
-                printf("emulator: RESET\n");
-                fflush(stdout);
-                break;
-            }
-            case MsgType::RegWrite: {
-                RegWriteMsg r; std::memcpy(&r, buf.data(), sizeof(r));
-                card->reg_write(r.addr, r.value);
-                break;
-            }
-            case MsgType::RegRead: {
-                RegReadMsg r; std::memcpy(&r, buf.data(), sizeof(r));
-                RegReadRespMsg resp{ r.addr, card->reg_read(r.addr) };
-                send_msg(client, MsgType::RegReadResp, &resp, sizeof(resp));
-                break;
-            }
-            case MsgType::PciConfigRead: {
-                PciConfigReadMsg r; std::memcpy(&r, buf.data(), sizeof(r));
-                PciConfigRespMsg resp{ r.reg, card->pci_config_read(r.reg) };
-                send_msg(client, MsgType::PciConfigResp, &resp, sizeof(resp));
-                break;
-            }
-            case MsgType::DumpVram: {
-                DumpVramMsg r; std::memcpy(&r, buf.data(), sizeof(r));
-                std::vector<uint8_t> out(r.len);
-                card->dump_vram(r.offset, r.len, out.data());
-                DumpVramRespHdr resp{ r.offset, r.len, card->get_exec_time_us() };
-                MsgHeader msg_hdr{ (uint32_t)MsgType::DumpVramResp, (uint32_t)(sizeof(resp) + r.len) };
-                send_all(client, &msg_hdr, sizeof(msg_hdr));
-                send_all(client, &resp, sizeof(resp));
-                send_all(client, out.data(), r.len);
-                break;
-            }
-            case MsgType::UploadVram: {
-                UploadVramMsg r; std::memcpy(&r, buf.data(), sizeof(r));
-                card->upload_vram(r.offset, r.len, buf.data() + sizeof(r));
-                break;
-            }
-            default: break;
-        }
-    }
-
-    close_socket(client);
-    close_socket(lsock);
+    interactive_menu();
     return 0;
 }
